@@ -1,11 +1,25 @@
 package quota
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
 	"sync/atomic"
 )
+
+// ErrVersionConflict 在提交的配置版本号不能使系统版本严格单调递增
+// （重复或回退，或非「当前版本 + 1」）时返回。
+// 被拒绝时旧配置保持完整生效。
+var ErrVersionConflict = errors.New("quota: config version conflict")
+
+// Option 配置管理器的可选参数。
+type Option func(*Manager)
+
+// WithReclaimHook 注册容量回收时的归还通知回调（见 ReclaimHook）。
+func WithReclaimHook(h ReclaimHook) Option {
+	return func(m *Manager) { m.reclaimHook = h }
+}
 
 // Manager 分层配额管理器。
 // 生效配置以原子指针整体切换，任一时刻只存在某个已提交版本的完整快照。
@@ -18,17 +32,21 @@ type Manager struct {
 	borrows      map[uint64]*BorrowRecord
 	nextBorrowID uint64
 
-	store Store
+	store       Store
+	reclaimHook ReclaimHook
 }
 
 // NewManager 以给定初始配置创建管理器。
 // 若 store 中存在最近一次已提交版本，则从该版本恢复（重启恢复语义）；
-// 否则将 initial 作为首个已提交版本落盘。
-func NewManager(initial *Config, store Store) (*Manager, error) {
+// 否则将 initial 作为首个已提交版本（系统分配版本号 1）落盘。
+// initial 会被深拷贝隔离：调用方此后修改原对象不影响系统生效配置。
+func NewManager(initial *Config, store Store, opts ...Option) (*Manager, error) {
 	if err := Validate(initial); err != nil {
 		return nil, err
 	}
-	committed := initial
+	committed := cloneConfig(initial)
+	// 首次提交版本号由系统分配为 1；store 非空且存在已提交版本时会被下面的恢复覆盖。
+	committed.Version = 1
 	if store != nil {
 		loaded, err := store.Load()
 		if err != nil {
@@ -38,9 +56,12 @@ func NewManager(initial *Config, store Store) (*Manager, error) {
 			if err := Validate(loaded); err != nil {
 				return nil, fmt.Errorf("quota: committed config invalid: %w", err)
 			}
-			committed = loaded
-		} else if err := store.Save(initial); err != nil {
-			return nil, fmt.Errorf("quota: persist initial config: %w", err)
+			committed = cloneConfig(loaded)
+		} else {
+			// 首次提交落盘（版本已由系统分配为 1）。
+			if err := store.Save(committed); err != nil {
+				return nil, fmt.Errorf("quota: persist initial config: %w", err)
+			}
 		}
 	}
 
@@ -49,14 +70,18 @@ func NewManager(initial *Config, store Store) (*Manager, error) {
 		borrows: make(map[uint64]*BorrowRecord),
 		store:   store,
 	}
+	for _, opt := range opts {
+		opt(m)
+	}
 	m.root = m.buildTree(committed, nil)
 	m.cfg.Store(committed)
 	return m, nil
 }
 
 // Config 返回当前生效配置的完整快照（只读）。
+// 返回的是独立深拷贝：调用方修改副本不会影响系统中正在生效的配置。
 func (m *Manager) Config() *Config {
-	return m.cfg.Load()
+	return cloneConfig(m.cfg.Load())
 }
 
 // buildTree 由配置构建配额树并计算每个组的有效上限快照。
@@ -209,20 +234,31 @@ func (m *Manager) Release(group string, res ResourceName, amount int64) error {
 // Reconfigure 原子地切换到新配置。
 // 校验或持久化失败时整体回退到上一个已提交版本；
 // 成功后新配置成为唯一生效快照，已登记用量按组名保留。
+//
+// 版本号由系统自动维护：新配置的版本必须恰好等于「当前已提交版本 + 1」，
+// 任何重复、回退或跳跃的提交都以 ErrVersionConflict 拒绝，旧配置保持完整生效。
+// 提交内容被深拷贝隔离，调用方此后修改原对象不影响系统生效配置。
 func (m *Manager) Reconfigure(c *Config) error {
 	if err := Validate(c); err != nil {
 		return err // 校验失败：整体回退，旧版本继续生效
 	}
+	next := cloneConfig(c)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	current := m.cfg.Load()
+	if next.Version != current.Version+1 {
+		return fmt.Errorf("%w: got version %d, want %d",
+			ErrVersionConflict, next.Version, current.Version+1)
+	}
+
 	if m.store != nil {
-		if err := m.store.Save(c); err != nil {
+		if err := m.store.Save(next); err != nil {
 			return fmt.Errorf("quota: persist config: %w", err) // 落盘失败：整体回退
 		}
 	}
 	prev := m.groups
-	m.root = m.buildTree(c, prev)
+	m.root = m.buildTree(next, prev)
 	// 过滤掉已不存在组的借用记录，并重放剩余记录以重建借出/借入视图。
 	kept := make(map[uint64]*BorrowRecord, len(m.borrows))
 	for id, br := range m.borrows {
@@ -236,7 +272,7 @@ func (m *Manager) Reconfigure(c *Config) error {
 	}
 	m.borrows = kept
 	m.replayBorrowsLocked()
-	m.cfg.Store(c)
+	m.cfg.Store(next)
 	return nil
 }
 
@@ -266,13 +302,28 @@ func (m *Manager) sortedBorrowsLocked() []*BorrowRecord {
 	return out
 }
 
-// ReclaimBorrows 回收借出容量，返回超额占用清单。
-// 归还按确定顺序（借用记录 ID 升序）进行；
-// 归还期间新请求按回缩后的剩余量判定（同一临界区内完成回缩）。
+// ReclaimBorrows 回收借出容量，并在回收动作内自动归还全部超额占用。
+//
+// 处理在同一临界区内完成，顺序完全确定、多次触发结果可复现：
+//  1. 先按借用记录 ID 升序撤销全部借出登记（借出方恢复额度、借入组失去借入量）；
+//  2. 再按「组名升序、资源名升序、子树后序（叶子优先、本组最后）」的确定顺序，
+//     将每个组超出其有效硬上限的合计用量从其自身/后代的已登记用量中自动扣减；
+//  3. 每个产生实际扣减的（组, 资源）返回一条 OverOccupancy，
+//     Released 与系统实际归还的量一一对应，并在回收时点反映该组的超额明细。
+//
+// 回收完成后任一组的合计用量都不超过其有效硬上限；无需调用方另行释放。
+// 回收与新请求在同一互斥临界区内交错，新请求一律按回缩后的剩余额度判定。
+// 某资源归还回调（见 WithReclaimHook）报错只记录在对应项的 ReclaimError 中，
+// 账面归还照常完成，不波及其它资源的记账与其它组的额度。
 func (m *Manager) ReclaimBorrows() []OverOccupancy {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.reclaimBorrowsLocked()
+}
 
+// reclaimBorrowsLocked 为回收主体，调用方须持有 m.mu。
+// 单独抽出以便在同一临界区内完成「回收 + 校验」，避免与新请求交错。
+func (m *Manager) reclaimBorrowsLocked() []OverOccupancy {
 	for _, br := range m.sortedBorrowsLocked() {
 		lender := m.groups[br.Lender]
 		borrower := m.groups[br.Borrower]
@@ -281,13 +332,13 @@ func (m *Manager) ReclaimBorrows() []OverOccupancy {
 		delete(m.borrows, br.ID)
 	}
 
-	// 汇总回缩后的超额占用：合计用量超过自有有效硬上限的组。
-	var out []OverOccupancy
+	// 回缩并自动归还：按组名升序处理超额的组，保证结果可复现。
 	names := make([]string, 0, len(m.groups))
 	for name := range m.groups {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	var out []OverOccupancy
 	for _, name := range names {
 		gs := m.groups[name]
 		resNames := make([]string, 0, len(gs.eff))
@@ -297,11 +348,53 @@ func (m *Manager) ReclaimBorrows() []OverOccupancy {
 		sort.Strings(resNames)
 		for _, res := range resNames {
 			r := ResourceName(res)
-			if excess := subtreeUsed(gs, r) - capOf(gs, r); excess > 0 {
-				out = append(out, OverOccupancy{Group: name, Resource: r, Excess: excess})
+			excess := subtreeUsed(gs, r) - capOf(gs, r)
+			if excess <= 0 {
+				continue
+			}
+			released := m.forceReleaseLocked(gs, r, excess)
+			for _, item := range released {
+				// 该（组, 资源）的超额头寸一致：Excess 为回收时点超出量，
+				// Released 为实际归还量；released 各项之和恰为 excess。
+				item.Excess = excess
+				if m.reclaimHook != nil {
+					item.ReclaimError = m.reclaimHook(item.Group, item.Resource, item.Released)
+				}
+				out = append(out, item)
 			}
 		}
 	}
+	return out
+}
+
+// forceReleaseLocked 在不依赖调用方释放的前提下，按确定顺序从 gs 子树中
+// 强制扣减 want 用量，使 subtreeUsed(gs,res) 回到有效硬上限之内。
+// 遍历顺序为子树后序（先子组后本组，子组按名称升序），优先释放叶子用量、
+// 最后才扣减本组自身，使每个具体登记组的超额头寸都能独立呈现，
+// 返回每个实际被扣减的（组, 资源）一条记录（Released 为实际扣减量）。
+// 调用方须持有 m.mu。
+func (m *Manager) forceReleaseLocked(gs *groupState, res ResourceName, want int64) []OverOccupancy {
+	var out []OverOccupancy
+	var walk func(node *groupState)
+	walk = func(node *groupState) {
+		for _, ch := range node.children {
+			walk(ch)
+		}
+		if want > 0 && node.usedOwn[res] > 0 {
+			take := node.usedOwn[res]
+			if take > want {
+				take = want
+			}
+			node.usedOwn[res] -= take
+			want -= take
+			out = append(out, OverOccupancy{
+				Group:    node.cfg.Name,
+				Resource: res,
+				Released: take,
+			})
+		}
+	}
+	walk(gs)
 	return out
 }
 

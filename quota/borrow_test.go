@@ -126,11 +126,26 @@ func TestReclaimBorrowsProducesOverOccupancy(t *testing.T) {
 	if over[0].Group != "hi" || over[0].Resource != "cpu" || over[0].Excess != 120 {
 		t.Fatalf("unexpected over-occupancy: %+v", over[0])
 	}
+	if over[0].Released != 120 {
+		t.Fatalf("auto-released = %d, want 120 (must match excess 1:1)", over[0].Released)
+	}
 	if got := len(m.Borrows()); got != 0 {
 		t.Fatalf("borrow records after reclaim = %d, want 0", got)
 	}
 
-	// 归还后：借出方恢复全额；借入方按回缩后剩余量判定，新请求被拒。
+	// 回收动作内已自动归还超额占用：hi 用量回到其有效硬顶 100 之内，
+	// 无需调用方另行 Release。
+	snapHi, err := m.Snapshot("hi")
+	if err != nil {
+		t.Fatalf("Snapshot hi: %v", err)
+	}
+	if got := snapHi.Resources["cpu"].Used; got != 100 {
+		t.Fatalf("hi used after reclaim = %d, want 100 (auto-released within reclaim)", got)
+	}
+	if got := snapHi.Resources["cpu"].Remaining; got != 0 {
+		t.Fatalf("hi remaining after reclaim = %d, want 0 (exactly at hard cap)", got)
+	}
+	// 归还后：借出方恢复全额。
 	snap, err := m.Snapshot("lo1")
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
@@ -138,19 +153,34 @@ func TestReclaimBorrowsProducesOverOccupancy(t *testing.T) {
 	if got := snap.Resources["cpu"].Remaining; got != 100 {
 		t.Fatalf("lo1 remaining after reclaim = %d, want 100", got)
 	}
-	if err := m.Acquire("hi", "cpu", 1); err == nil {
-		t.Fatal("hi should be rejected after reclaim (over occupied)")
-	}
-	// hi 释放超额部分后可继续正常申请。
-	if err := m.Release("hi", "cpu", 120); err != nil {
-		t.Fatalf("hi release: %v", err)
-	}
+	// 借入方已恰好处于自有硬顶：回缩后的自身剩余为 0。
+	// 新请求按回缩后的状态判定——自有额度不足时走全新借用流程，
+	// 而不是落进回收前遗留的超额登记。
 	if err := m.Acquire("hi", "cpu", 1); err != nil {
-		t.Fatalf("hi acquire after releasing excess: %v", err)
+		t.Fatalf("hi acquire 1 via fresh borrow after reclaim: %v", err)
+	}
+	br := m.Borrows()
+	if len(br) != 1 || br[0].Amount != 1 || br[0].Lender != "lo1" {
+		t.Fatalf("expected one fresh borrow of 1 from lo1, got %+v", br)
+	}
+	snapHi2, err := m.Snapshot("hi")
+	if err != nil {
+		t.Fatalf("Snapshot hi: %v", err)
+	}
+	if got := snapHi2.Resources["cpu"].Used; got != 101 {
+		t.Fatalf("hi used = %d, want 101", got)
+	}
+	// 超量新申请（超出全树可借）依旧被硬顶拒绝，不会产生残留记录。
+	before := len(m.Borrows())
+	if err := m.Acquire("hi", "cpu", 500); err == nil {
+		t.Fatal("huge acquire must be rejected by hard cap")
+	}
+	if got := len(m.Borrows()); got != before {
+		t.Fatalf("failed acquire left borrow records: %d -> %d", before, got)
 	}
 }
 
-func TestReclaimOrderIsDeterministic(t *testing.T) {
+func TestReclaimAutoReleaseIsDeterministic(t *testing.T) {
 	m := newBorrowManager(t)
 	if err := m.Acquire("hi", "cpu", 100); err != nil {
 		t.Fatalf("acquire: %v", err)
@@ -159,12 +189,52 @@ func TestReclaimOrderIsDeterministic(t *testing.T) {
 		t.Fatalf("acquire via borrow: %v", err)
 	}
 	first := m.ReclaimBorrows()
-	second := m.ReclaimBorrows() // 幂等：无记录可还，清单只反映当前超额
-	if len(first) != 1 || first[0].Excess != 150 {
-		t.Fatalf("first reclaim = %+v, want single excess 150", first)
+	// 第一次回收：撤销借用并自动归还 150，hi 回到硬顶 100。
+	if len(first) != 1 || first[0].Excess != 150 || first[0].Released != 150 {
+		t.Fatalf("first reclaim = %+v, want single entry excess/released 150", first)
 	}
-	if len(second) != 1 || second[0].Excess != 150 {
-		t.Fatalf("second reclaim = %+v, want same excess 150 (usage unchanged)", second)
+	snap, err := m.Snapshot("hi")
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if got := snap.Resources["cpu"].Used; got != 100 {
+		t.Fatalf("hi used = %d, want 100 after auto-release", got)
+	}
+	// 第二次回收：无借用记录、无超额，清单为空且账上无变化（幂等、可复现）。
+	second := m.ReclaimBorrows()
+	if len(second) != 0 {
+		t.Fatalf("second reclaim = %+v, want empty (nothing over hard cap)", second)
+	}
+	snap2, err := m.Snapshot("hi")
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if got := snap2.Resources["cpu"].Used; got != 100 {
+		t.Fatalf("hi used after second reclaim = %d, want 100 (unchanged)", got)
+	}
+}
+
+// TestReclaimReproducibleAcrossManagers 多次触发回收、同样初始状态下结果可复现。
+func TestReclaimReproducibleAcrossManagers(t *testing.T) {
+	run := func() []OverOccupancy {
+		m := newBorrowManager(t)
+		if err := m.Acquire("hi", "cpu", 100); err != nil {
+			t.Fatalf("acquire: %v", err)
+		}
+		if err := m.Acquire("hi", "cpu", 150); err != nil {
+			t.Fatalf("acquire via borrow: %v", err)
+		}
+		return m.ReclaimBorrows()
+	}
+	a := run()
+	b := run()
+	if len(a) != len(b) {
+		t.Fatalf("reclaim results differ in length: %d vs %d", len(a), len(b))
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			t.Fatalf("reclaim result[%d] not reproducible: %+v vs %+v", i, a[i], b[i])
+		}
 	}
 }
 

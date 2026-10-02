@@ -66,3 +66,34 @@ func Validate(c *Config) error {
 	}
 	return nil
 }
+
+// cloneConfig 返回配置的独立深拷贝：拷贝与原配置不共享任何 map/指针，
+// 任一方后续被修改都不会影响另一方。
+func cloneConfig(c *Config) *Config {
+	if c == nil {
+		return nil
+	}
+	cp := &Config{Version: c.Version}
+	if c.Groups != nil {
+		cp.Groups = make(map[string]*GroupConfig, len(c.Groups))
+		for name, g := range c.Groups {
+			cp.Groups[name] = cloneGroupConfig(g)
+		}
+	}
+	return cp
+}
+
+// cloneGroupConfig 返回单组配置的独立深拷贝。
+func cloneGroupConfig(g *GroupConfig) *GroupConfig {
+	if g == nil {
+		return nil
+	}
+	cp := *g
+	if g.Quotas != nil {
+		cp.Quotas = make(map[ResourceName]Limit, len(g.Quotas))
+		for res, l := range g.Quotas {
+			cp.Quotas[res] = l
+		}
+	}
+	return &cp
+}

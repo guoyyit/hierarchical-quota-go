@@ -17,7 +17,18 @@ type OverOccupancy struct {
 	Resource ResourceName `json:"resource"`
 	// Excess 为回缩后超出其自有有效额度的部分。
 	Excess int64 `json:"excess"`
+	// Released 为回收动作内系统自动从该组该资源归还/释放的量，与 Excess 一一对应。
+	Released int64 `json:"released"`
+	// ReclaimError 记录本资源自动归还过程中出现的异常；
+	// 该异常只影响本项，不影响其它资源的记账与其它组的额度。
+	ReclaimError error `json:"-"`
 }
+
+// ReclaimHook 回收回调：回收动作内某组某资源被系统强制归还用量后调用，
+// group/res/amount 与返回清单中的项一一对应。
+// 回调返回的错误只记录在对应超额项的 ReclaimError 中：
+// 账面用量已在系统侧释放完成，错误不影响其它资源与其它组。
+type ReclaimHook func(group string, res ResourceName, amount int64) error
 
 // groupState 配额树中一个组的运行态。
 type groupState struct {
