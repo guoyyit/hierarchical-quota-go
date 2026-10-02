@@ -66,3 +66,29 @@ func Validate(c *Config) error {
 	}
 	return nil
 }
+
+// DeepCopy 返回配置的深拷贝：副本与原对象彻底隔离，
+// 调用方之后对任一层（组、配额 map、字段）的修改都不会波及另一方。
+// 系统在配置进入已提交状态与对外返回生效配置时都必须经过深拷贝。
+func (c *Config) DeepCopy() *Config {
+	if c == nil {
+		return nil
+	}
+	out := &Config{
+		Version: c.Version,
+		Groups:  make(map[string]*GroupConfig, len(c.Groups)),
+	}
+	for name, g := range c.Groups {
+		if g == nil {
+			out.Groups[name] = nil
+			continue
+		}
+		ng := *g
+		ng.Quotas = make(map[ResourceName]Limit, len(g.Quotas))
+		for res, l := range g.Quotas {
+			ng.Quotas[res] = l
+		}
+		out.Groups[name] = &ng
+	}
+	return out
+}

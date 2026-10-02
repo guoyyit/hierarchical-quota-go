@@ -22,6 +22,12 @@ type Usage struct {
 	Borrowed  int64 `json:"borrowed"`  // 借入量
 	LentOut   int64 `json:"lent_out"`  // 借出（被预留）量
 	Remaining int64 `json:"remaining"` // 当前可再消耗量
+	// SoftExceeded 合计用量（含借入部分）是否已越过有效软上限。
+	// 与同一快照内的 Aggregate、Soft 严格自洽：SoftExceeded == (Aggregate > Soft)。
+	SoftExceeded bool `json:"soft_exceeded"`
+	// SoftExcess 越过软上限的精确超出量；未越过时为 0。
+	// 与同一快照自洽：SoftExcess == max(0, Aggregate - Soft)。
+	SoftExcess int64 `json:"soft_excess"`
 }
 
 // Snapshot 返回 group 及其后代在某一时间点的自洽快照。
@@ -54,18 +60,25 @@ func buildSnapshot(gs *groupState, version uint64) *GroupSnapshot {
 	for _, name := range resNames {
 		res := ResourceName(name)
 		lim := gs.eff[res]
-		remaining := lim.Hard - gs.lentOut[res] + gs.borrowed[res] - subtreeUsed(gs, res)
+		agg := subtreeUsed(gs, res)
+		remaining := lim.Hard - gs.lentOut[res] + gs.borrowed[res] - agg
 		if remaining < 0 {
 			remaining = 0
 		}
+		softExcess := agg - lim.Soft
+		if softExcess < 0 {
+			softExcess = 0
+		}
 		snap.Resources[res] = Usage{
-			Used:      gs.usedOwn[res],
-			Aggregate: subtreeUsed(gs, res),
-			Soft:      lim.Soft,
-			Hard:      lim.Hard,
-			Borrowed:  gs.borrowed[res],
-			LentOut:   gs.lentOut[res],
-			Remaining: remaining,
+			Used:         gs.usedOwn[res],
+			Aggregate:    agg,
+			Soft:         lim.Soft,
+			Hard:         lim.Hard,
+			Borrowed:     gs.borrowed[res],
+			LentOut:      gs.lentOut[res],
+			Remaining:    remaining,
+			SoftExceeded: agg > lim.Soft,
+			SoftExcess:   softExcess,
 		}
 	}
 	for _, ch := range gs.children {

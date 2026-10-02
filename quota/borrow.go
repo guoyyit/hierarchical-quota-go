@@ -11,11 +11,12 @@ type BorrowRecord struct {
 	Amount   int64        `json:"amount"`
 }
 
-// OverOccupancy 容量回收后某组对某资源的超额占用项。
+// OverOccupancy 容量回收时某组对某资源的超额占用项。
 type OverOccupancy struct {
 	Group    string       `json:"group"`
 	Resource ResourceName `json:"resource"`
-	// Excess 为回缩后超出其自有有效额度的部分。
+	// Excess 为回缩后超出其有效硬上限、并已在回收动作内被系统
+	// 自动释放的量：清单条目与实际释放量一一对应。
 	Excess int64 `json:"excess"`
 }
 

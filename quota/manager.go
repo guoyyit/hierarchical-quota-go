@@ -24,11 +24,12 @@ type Manager struct {
 // NewManager 以给定初始配置创建管理器。
 // 若 store 中存在最近一次已提交版本，则从该版本恢复（重启恢复语义）；
 // 否则将 initial 作为首个已提交版本落盘。
+// 进入已提交状态的配置一律深拷贝，与调用方持有的原对象彻底隔离。
 func NewManager(initial *Config, store Store) (*Manager, error) {
 	if err := Validate(initial); err != nil {
 		return nil, err
 	}
-	committed := initial
+	committed := initial.DeepCopy()
 	if store != nil {
 		loaded, err := store.Load()
 		if err != nil {
@@ -38,8 +39,8 @@ func NewManager(initial *Config, store Store) (*Manager, error) {
 			if err := Validate(loaded); err != nil {
 				return nil, fmt.Errorf("quota: committed config invalid: %w", err)
 			}
-			committed = loaded
-		} else if err := store.Save(initial); err != nil {
+			committed = loaded.DeepCopy()
+		} else if err := store.Save(committed); err != nil {
 			return nil, fmt.Errorf("quota: persist initial config: %w", err)
 		}
 	}
@@ -54,9 +55,10 @@ func NewManager(initial *Config, store Store) (*Manager, error) {
 	return m, nil
 }
 
-// Config 返回当前生效配置的完整快照（只读）。
+// Config 返回当前生效配置的独立深拷贝：
+// 调用方修改返回值不会影响系统内正在生效的限额。
 func (m *Manager) Config() *Config {
-	return m.cfg.Load()
+	return m.cfg.Load().DeepCopy()
 }
 
 // buildTree 由配置构建配额树并计算每个组的有效上限快照。
@@ -207,8 +209,11 @@ func (m *Manager) Release(group string, res ResourceName, amount int64) error {
 }
 
 // Reconfigure 原子地切换到新配置。
-// 校验或持久化失败时整体回退到上一个已提交版本；
+// 版本号由系统强制维护：必须严格大于当前已提交版本，
+// 重复或回退版本的提交被拒绝，旧配置保持完整生效。
+// 校验、版本检查或持久化失败时整体回退到上一个已提交版本；
 // 成功后新配置成为唯一生效快照，已登记用量按组名保留。
+// 被接受的配置先深拷贝再生效与落盘，与调用方后续修改彻底隔离。
 func (m *Manager) Reconfigure(c *Config) error {
 	if err := Validate(c); err != nil {
 		return err // 校验失败：整体回退，旧版本继续生效
@@ -216,13 +221,19 @@ func (m *Manager) Reconfigure(c *Config) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	cur := m.cfg.Load()
+	if c.Version <= cur.Version {
+		return fmt.Errorf("quota: config version %d must be greater than current committed version %d",
+			c.Version, cur.Version) // 版本重复或回退：拒绝，旧版本继续生效
+	}
+	committed := c.DeepCopy()
 	if m.store != nil {
-		if err := m.store.Save(c); err != nil {
+		if err := m.store.Save(committed); err != nil {
 			return fmt.Errorf("quota: persist config: %w", err) // 落盘失败：整体回退
 		}
 	}
 	prev := m.groups
-	m.root = m.buildTree(c, prev)
+	m.root = m.buildTree(committed, prev)
 	// 过滤掉已不存在组的借用记录，并重放剩余记录以重建借出/借入视图。
 	kept := make(map[uint64]*BorrowRecord, len(m.borrows))
 	for id, br := range m.borrows {
@@ -236,7 +247,7 @@ func (m *Manager) Reconfigure(c *Config) error {
 	}
 	m.borrows = kept
 	m.replayBorrowsLocked()
-	m.cfg.Store(c)
+	m.cfg.Store(committed)
 	return nil
 }
 
@@ -266,13 +277,24 @@ func (m *Manager) sortedBorrowsLocked() []*BorrowRecord {
 	return out
 }
 
-// ReclaimBorrows 回收借出容量，返回超额占用清单。
-// 归还按确定顺序（借用记录 ID 升序）进行；
-// 归还期间新请求按回缩后的剩余量判定（同一临界区内完成回缩）。
+// ReclaimBorrows 回收借出容量，并在同一临界区内自动释放超额占用。
+//
+// 整个过程在单个临界区内完成，与并发新请求交错时，
+// 新请求只会看到回收前或回收后的完整状态，按回缩后的剩余额度判定：
+//  1. 按借用记录 ID 升序的确定顺序归还全部借出容量；
+//  2. 按（组名升序、资源名升序）的确定顺序，自动释放各组超出其
+//     有效硬上限的合计用量（先释放本组自身用量，再按名称升序深度
+//     优先释放后代用量），多次触发结果可复现；
+//  3. 返回的超额占用清单与实际释放量一一对应（Excess 即释放量）。
+//
+// 回收完成后任一组的合计用量不超过其有效硬上限；
+// 再次触发回收（无新借用/新占用时）返回空清单，幂等。
+// 单个资源的释放异常只影响该资源自身的清单条目，不影响其它资源与其它组。
 func (m *Manager) ReclaimBorrows() []OverOccupancy {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// 第一步：归还全部借出容量（记录 ID 升序，确定顺序）。
 	for _, br := range m.sortedBorrowsLocked() {
 		lender := m.groups[br.Lender]
 		borrower := m.groups[br.Borrower]
@@ -281,7 +303,7 @@ func (m *Manager) ReclaimBorrows() []OverOccupancy {
 		delete(m.borrows, br.ID)
 	}
 
-	// 汇总回缩后的超额占用：合计用量超过自有有效硬上限的组。
+	// 第二步：按确定顺序自动释放超额占用，清单条目与实际释放量一一对应。
 	var out []OverOccupancy
 	names := make([]string, 0, len(m.groups))
 	for name := range m.groups {
@@ -297,12 +319,39 @@ func (m *Manager) ReclaimBorrows() []OverOccupancy {
 		sort.Strings(resNames)
 		for _, res := range resNames {
 			r := ResourceName(res)
-			if excess := subtreeUsed(gs, r) - capOf(gs, r); excess > 0 {
-				out = append(out, OverOccupancy{Group: name, Resource: r, Excess: excess})
+			excess := subtreeUsed(gs, r) - capOf(gs, r)
+			if excess <= 0 {
+				continue
+			}
+			released := releaseSubtreeLocked(gs, r, excess)
+			if released > 0 {
+				out = append(out, OverOccupancy{Group: name, Resource: r, Excess: released})
 			}
 		}
 	}
 	return out
+}
+
+// releaseSubtreeLocked 在 gs 子树内按确定顺序（先 gs 自身，再按名称升序
+// 深度优先遍历后代）释放至多 amount 的 resource 用量，返回实际释放量。
+// 只扣减计数，不触碰其它资源与其它子树的记账。调用方须持有 m.mu。
+func releaseSubtreeLocked(gs *groupState, res ResourceName, amount int64) int64 {
+	if amount <= 0 {
+		return 0
+	}
+	var released int64
+	if u := gs.usedOwn[res]; u > 0 {
+		take := minInt64(u, amount)
+		gs.usedOwn[res] -= take
+		released += take
+	}
+	for _, ch := range gs.children { // children 已按名称升序固定
+		if released == amount {
+			break
+		}
+		released += releaseSubtreeLocked(ch, res, amount-released)
+	}
+	return released
 }
 
 // Borrows 返回当前借用记录的只读副本（按 ID 升序）。

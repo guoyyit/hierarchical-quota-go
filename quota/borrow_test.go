@@ -130,7 +130,16 @@ func TestReclaimBorrowsProducesOverOccupancy(t *testing.T) {
 		t.Fatalf("borrow records after reclaim = %d, want 0", got)
 	}
 
-	// 归还后：借出方恢复全额；借入方按回缩后剩余量判定，新请求被拒。
+	// 回收动作内已自动释放超额占用：hi 的用量回缩到自有有效硬顶 100，
+	// 无需调用方另行释放；清单中的 Excess(120) 即系统实际释放量。
+	snapHi, err := m.Snapshot("hi")
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if got := snapHi.Resources["cpu"].Aggregate; got != 100 {
+		t.Fatalf("hi aggregate after reclaim = %d, want 100 (auto-released excess)", got)
+	}
+	// 借出方恢复全额。
 	snap, err := m.Snapshot("lo1")
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
@@ -138,15 +147,9 @@ func TestReclaimBorrowsProducesOverOccupancy(t *testing.T) {
 	if got := snap.Resources["cpu"].Remaining; got != 100 {
 		t.Fatalf("lo1 remaining after reclaim = %d, want 100", got)
 	}
-	if err := m.Acquire("hi", "cpu", 1); err == nil {
-		t.Fatal("hi should be rejected after reclaim (over occupied)")
-	}
-	// hi 释放超额部分后可继续正常申请。
-	if err := m.Release("hi", "cpu", 120); err != nil {
-		t.Fatalf("hi release: %v", err)
-	}
+	// hi 已回到额度之内：可按正常规则继续消耗（此处经重新借用成功）。
 	if err := m.Acquire("hi", "cpu", 1); err != nil {
-		t.Fatalf("hi acquire after releasing excess: %v", err)
+		t.Fatalf("hi acquire after auto-release should succeed: %v", err)
 	}
 }
 
@@ -159,12 +162,20 @@ func TestReclaimOrderIsDeterministic(t *testing.T) {
 		t.Fatalf("acquire via borrow: %v", err)
 	}
 	first := m.ReclaimBorrows()
-	second := m.ReclaimBorrows() // 幂等：无记录可还，清单只反映当前超额
+	second := m.ReclaimBorrows() // 幂等：无记录可还、无超额可释放，返回空清单
 	if len(first) != 1 || first[0].Excess != 150 {
 		t.Fatalf("first reclaim = %+v, want single excess 150", first)
 	}
-	if len(second) != 1 || second[0].Excess != 150 {
-		t.Fatalf("second reclaim = %+v, want same excess 150 (usage unchanged)", second)
+	if len(second) != 0 {
+		t.Fatalf("second reclaim = %+v, want empty (excess already auto-released)", second)
+	}
+	// 自动释放后 hi 合计用量回缩到自有有效硬顶 100。
+	snap, err := m.Snapshot("hi")
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if got := snap.Resources["cpu"].Aggregate; got != 100 {
+		t.Fatalf("hi aggregate after reclaim = %d, want 100", got)
 	}
 }
 

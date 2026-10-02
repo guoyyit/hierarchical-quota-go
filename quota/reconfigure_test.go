@@ -3,6 +3,7 @@ package quota
 import (
 	"errors"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -85,7 +86,7 @@ func TestReconfigureRollbackOnInvalid(t *testing.T) {
 	if err := m.Reconfigure(bad); err == nil {
 		t.Fatal("reconfigure with two roots should fail")
 	}
-	if got := m.Config(); got != before {
+	if got := m.Config(); !reflect.DeepEqual(got, before) {
 		t.Fatalf("config changed after failed reconfigure: version %d", got.Version)
 	}
 
@@ -95,7 +96,7 @@ func TestReconfigureRollbackOnInvalid(t *testing.T) {
 	if err := m.Reconfigure(cyclic); err == nil {
 		t.Fatal("reconfigure with cycle should fail")
 	}
-	if got := m.Config(); got != before {
+	if got := m.Config(); !reflect.DeepEqual(got, before) {
 		t.Fatal("config changed after cyclic reconfigure")
 	}
 
